@@ -1,0 +1,258 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from datetime import datetime
+from ib_insync import *
+import nest_asyncio
+
+nest_asyncio.apply()
+
+# ==================== CONFIGURACIÓN VISUAL PROFESIONAL ====================
+st.set_page_config(page_title="GEX PRO", layout="wide", page_icon="⚡")
+
+# Custom CSS para título naranja + mejoras visuales
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 42px;
+        font-weight: 700;
+        color: #FF9500 !important;  /* Naranja brillante como pediste */
+        text-align: center;
+        margin-bottom: 10px;
+    }
+    .sub-header {
+        font-size: 18px;
+        color: #AAAAAA;
+        text-align: center;
+        margin-bottom: 30px;
+    }
+    .metric-positive { color: #00FFAA; }
+    .metric-negative { color: #FF5555; }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 24px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-size: 16px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<h1 class="main-header">⚡ GEX PRO</h1>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Gamma Exposure Analyzer para Futuros • /ES & /NQ • Datos CME vía IBKR</p>', unsafe_allow_html=True)
+st.caption("Inspirado en gexanalyzer.streamlit.app | Auto-Refresh 60s")
+
+# ==================== SIDEBAR ====================
+with st.sidebar:
+    st.header("⚙️ Configuración")
+    ticker = st.selectbox("TICKER", ["ES", "NQ"], index=0)
+    
+    auto_refresh = st.toggle("🔄 Auto-Refresh cada 60 segundos", value=True)
+    
+    st.subheader("Parámetros de Análisis")
+    strike_range_pct = st.slider("Rango de Strikes (%)", 5, 50, 25)
+    max_dte = st.slider("Vencimiento Máx. (días)", 7, 180, 90)
+    oi_min = st.number_input("OI Mínimo", value=500, min_value=100)
+    
+    st.subheader("Gráfico de Precio")
+    hist_days = st.slider("Histórico (días)", 5, 90, 30)
+    
+    if st.button("🔄 Actualizar Ahora", type="primary", use_container_width=True):
+        if 'last_update' in st.session_state:
+            st.session_state.last_update = None
+
+# ==================== CONEXIÓN IBKR ====================
+@st.cache_resource(show_spinner=False)
+def get_ib_connection():
+    ib = IB()
+    try:
+        host = st.secrets.get("IB_HOST", "127.0.0.1")
+        port = int(st.secrets.get("IB_PORT", 7497))
+        client_id = int(st.secrets.get("IB_CLIENT_ID", 999))
+        ib.connect(host, port, clientId=client_id)
+        return ib
+    except Exception as e:
+        st.error(f"❌ Error conectando a IBKR: {e}")
+        return None
+
+# ==================== FUNCIÓN DE CARGA Y CÁLCULO ====================
+def load_and_calculate_gex():
+    ib = get_ib_connection()
+    if not ib or not ib.isConnected():
+        st.error("Conexión IBKR no disponible. Verifica TWS/IB Gateway.")
+        return None
+
+    with st.spinner("Cargando cadena completa de opciones..."):
+        # (El código de carga es el mismo que la versión anterior - lo mantengo funcional)
+        future = Future(symbol=ticker, exchange='CME', currency='USD')
+        contracts = ib.qualifyContracts(future)
+        fut = contracts[0]
+
+        ticker_fut = ib.reqMktData(fut, '', snapshot=True)
+        ib.sleep(1)
+        spot = ticker_fut.last or ticker_fut.close
+
+        chains = ib.reqSecDefOptParams(ticker, futFopExchange='CME', underlyingSecType='FUT', underlyingConId=fut.conId)
+        chain = chains[0]
+        multiplier = 50 if ticker == "ES" else 20
+
+        today = datetime.now().date()
+        exp_list = []
+        for exp_str in chain.expirations:
+            try:
+                exp_date = datetime.strptime(exp_str, '%Y%m%d').date()
+                dte = (exp_date - today).days
+                if 0 <= dte <= max_dte:
+                    exp_list.append((exp_str, dte))
+            except:
+                continue
+        exp_list = sorted(exp_list, key=lambda x: x[1])[:10]
+
+        min_strike = round(spot * (1 - strike_range_pct/100))
+        max_strike = round(spot * (1 + strike_range_pct/100))
+
+        data = []
+        for exp_str, dte in exp_list:
+            for right in ['C', 'P']:
+                for strike in [s for s in chain.strikes if min_strike <= s <= max_strike]:
+                    opt = Option(symbol=ticker, lastTradeDateOrContractMonth=exp_str, strike=strike,
+                                 right=right, exchange='CME', currency='USD')
+                    qualified = ib.qualifyContracts(opt)
+                    if qualified:
+                        t = ib.reqMktData(qualified[0], '', snapshot=True)
+                        ib.sleep(0.08)
+                        if t.gamma is not None and t.openInterest is not None and t.openInterest >= oi_min:
+                            data.append({
+                                'strike': strike, 'expiry': exp_str, 'dte': dte, 'right': right,
+                                'gamma': t.gamma, 'oi': t.openInterest, 'impliedVol': t.impliedVol
+                            })
+
+        df = pd.DataFrame(data)
+        if df.empty:
+            return None
+
+        df['gex'] = df['gamma'] * df['oi'] * multiplier * spot
+        df.loc[df['right'] == 'P', 'gex'] *= -1
+        gex_by_strike = df.groupby('strike')['gex'].sum().reset_index()
+
+        # 0DTE
+        df_0dte = df[df['dte'] <= 1].copy()
+        gex_0dte = df_0dte.groupby('strike')['gex'].sum().reset_index()
+
+        # Niveles clave
+        call_resistance = df[df['right'] == 'C'].groupby('strike')['gex'].sum().idxmax()
+        put_support = df[df['right'] == 'P'].groupby('strike')['gex'].sum().idxmin()
+        call_res_0dte = df_0dte[df_0dte['right'] == 'C'].groupby('strike')['gex'].sum().idxmax() if not df_0dte.empty else None
+        put_sup_0dte = df_0dte[df_0dte['right'] == 'P'].groupby('strike')['gex'].sum().idxmin() if not df_0dte.empty else None
+        gamma_wall_0dte = gex_0dte.loc[gex_0dte['gex'].abs().idxmax(), 'strike'] if not gex_0dte.empty else None
+
+        # HVL / Gamma Flip
+        gex_sorted = gex_by_strike.sort_values('strike')
+        sign_change = gex_sorted['gex'] * gex_sorted['gex'].shift(1) < 0
+        hvl = gex_sorted.loc[sign_change.idxmax(), 'strike'] if sign_change.any() else spot
+
+        # Top 15 GEX
+        gex_abs = gex_by_strike.copy()
+        gex_abs['abs_gex'] = gex_abs['gex'].abs()
+        top15 = gex_abs.nlargest(15, 'abs_gex').sort_values('abs_gex', ascending=False)
+
+        # Max Pain (simplificado)
+        max_pain = gex_by_strike.loc[gex_by_strike['gex'].abs().idxmin(), 'strike'] if not gex_by_strike.empty else spot
+
+        gex_net = df['gex'].sum()
+        regime = "NEGATIVA" if gex_net < 0 else "POSITIVA"
+
+        return {
+            'df': df, 'spot': spot, 'gex_net': gex_net, 'regime': regime,
+            'max_pain': max_pain, 'hvl': hvl, 'call_resistance': call_resistance,
+            'put_support': put_support, 'call_res_0dte': call_res_0dte,
+            'put_sup_0dte': put_sup_0dte, 'gamma_wall_0dte': gamma_wall_0dte,
+            'top15': top15, 'gex_by_strike': gex_by_strike,
+            'timestamp': datetime.now()
+        }
+
+# ==================== AUTO-REFRESH ====================
+if 'last_update' not in st.session_state:
+    st.session_state.last_update = None
+
+if auto_refresh and (st.session_state.last_update is None or 
+                     (datetime.now() - st.session_state.last_update).total_seconds() >= 60):
+    st.session_state.data = load_and_calculate_gex()
+    st.session_state.last_update = datetime.now()
+    st.rerun()
+
+if 'data' not in st.session_state or st.session_state.data is None:
+    st.session_state.data = load_and_calculate_gex()
+    st.session_state.last_update = datetime.now()
+
+data = st.session_state.data
+if data is None:
+    st.stop()
+
+# ==================== DASHBOARD PROFESIONAL ====================
+last_update_str = data['timestamp'].strftime("%H:%M:%S")
+st.success(f"✅ Datos actualizados | Última actualización: {last_update_str}")
+
+# Métricas principales con colores
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Spot", f"${data['spot']:.2f}")
+col2.metric("Max Pain", f"${data['max_pain']:.2f}")
+col3.metric("HVL", f"${data['hvl']:.0f}")
+col4.metric("Call Resistance", f"${data['call_resistance']:.0f}")
+col5.metric("Put Support", f"${data['put_support']:.0f}")
+
+# Régimen Gamma con interpretación
+gex_net = data['gex_net']
+regime_color = "NEGATIVA" if gex_net < 0 else "POSITIVA"
+st.markdown(f"### 📊 Régimen Gamma: **{regime_color}**")
+if gex_net < 0:
+    st.info("🔴 Dealers cortos de gamma → volatilidad amplificada y movimientos tendenciales. Las rupturas tienden a persistir.")
+else:
+    st.info("🟢 Dealers largos de gamma → actúan como amortiguador. Mayor probabilidad de mean-reversion y rango.")
+
+# Niveles 0DTE
+st.markdown("### 📍 Niveles 0DTE")
+c1, c2, c3 = st.columns(3)
+c1.metric("Call Resistance 0DTE", f"${data['call_res_0dte']:.0f}" if data['call_res_0dte'] else "—")
+c2.metric("Put Support 0DTE", f"${data['put_sup_0dte']:.0f}" if data['put_sup_0dte'] else "—")
+c3.metric("Gamma Wall 0DTE", f"${data['gamma_wall_0dte']:.0f}" if data['gamma_wall_0dte'] else "—")
+
+# Top 15 GEX
+st.subheader("🔢 Top 15 GEX Levels")
+top_df = data['top15'][['strike', 'gex']].copy()
+top_df['% Spot'] = ((top_df['strike'] - data['spot']) / data['spot'] * 100).round(2)
+st.dataframe(top_df.style.format({"gex": "${:,.0f}", "% Spot": "{:+.2f}%"}), 
+             use_container_width=True, hide_index=True)
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["📉 Precio", "📈 Perfil Gamma", "🌊 Superficie 3D", "📋 Datos"])
+
+with tab1:
+    st.subheader("Precio Histórico")
+    ib = get_ib_connection()
+    future = Future(symbol=ticker, exchange='CME', currency='USD')
+    bars = ib.reqHistoricalData(future, '', f'{hist_days} D', '1 day', 'TRADES', useRTH=True)
+    df_hist = util.df(bars)
+    fig = go.Figure(go.Scatter(x=df_hist['date'], y=df_hist['close'], line=dict(color='#FF9500')))
+    fig.add_hline(y=data['spot'], line_dash="dash")
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    st.subheader("Perfil Gamma")
+    fig_gex = go.Figure(go.Bar(x=data['gex_by_strike']['strike'], y=data['gex_by_strike']['gex'], marker_color='#FF9500'))
+    fig_gex.add_vline(x=data['spot'], line_dash="dash")
+    st.plotly_chart(fig_gex, use_container_width=True)
+
+with tab3:
+    st.subheader("Superficie de Volatilidad 3D")
+    pivot = data['df'].pivot_table(index='dte', columns='strike', values='impliedVol', aggfunc='mean')
+    if not pivot.empty:
+        fig3d = go.Figure(data=[go.Surface(z=pivot.values, x=pivot.columns, y=pivot.index)])
+        st.plotly_chart(fig3d, use_container_width=True)
+
+with tab4:
+    st.subheader("Resumen Calls vs Puts")
+    summary = data['df'].groupby('right').agg({'gex':'sum', 'oi':'sum'})
+    st.dataframe(summary.style.format({"gex": "${:,.0f}"}), use_container_width=True)
+
+st.caption("GEX PRO para Futuros • Auto-refresh cada 60 segundos • Título en naranja • Mantén TWS abierto")
